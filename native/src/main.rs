@@ -591,47 +591,49 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let ingest_base = window_start - 10 * DAY;
     block.lines::<7>(|buf, fields| unsafe {
         let field = |at: usize| (buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize);
-        let (p, n) = field(0);
-        let id = keys::pack(p, n);
-        if id == 0 {
-            return;
-        }
-        let id = id ^ copy;
+        if fields[0].0 == fields[0].1 { return; }
         let (p, n) = field(3);
         let ingest = ts::parse(p, n, dates);
-        if ingest == ts::BAD {
-            return;
-        }
-        let (p, n) = field(1);
-        let user = keys::pack(p, n);
-        let user = if user == 0 { 0 } else { user ^ copy };
-        let (p, n) = field(2);
-        let at = ts::parse(p, n, dates);
+        if ingest == ts::BAD { return; }
+
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
-        let mut valid = user != 0
-            && (purchase || other)
-            && fields[5].1 > fields[5].0
-            && at >= window_start
-            && at < window_end
-            && ingest - at <= DAY;
+        let mut at = ts::BAD;
+        let mut user = 0;
         let mut payload = 0;
-        if purchase && valid {
-            let (p, n) = field(6);
-            let price = ts::price(p, n);
-            if price == 0 {
-                valid = false;
-            } else {
-                let (p, n) = field(5);
-                let category = shared.products.get(p, n);
-                let category = if category == 0 { shared.unknown } else { category - 1 };
-                payload = (category << 24) | price;
+        if (purchase || other) && fields[1].1 > fields[1].0 && fields[5].1 > fields[5].0 {
+            let (p, n) = field(2);
+            at = ts::parse(p, n, dates);
+            if at >= window_start && at < window_end && ingest - at <= DAY {
+                let price = if purchase {
+                    let (p, n) = field(6);
+                    ts::price(p, n)
+                } else { 0 };
+                if !purchase || price != 0 {
+                    let (p, n) = field(1);
+                    let raw = keys::pack(p, n);
+                    if raw != 0 {
+                        user = raw ^ copy;
+                        if purchase {
+                            let (p, n) = field(5);
+                            let category = shared.products.get(p, n);
+                            let category = if category == 0 { shared.unknown } else { category - 1 };
+                            payload = (category << 24) | price;
+                        }
+                    }
+                }
             }
         }
+        // Even invalid rows compete for earliest ingest by event ID.
+        let (p, n) = field(0);
+        let id = keys::pack(p, n);
+        if id == 0 { return; }
+        let id = id ^ copy;
+        let valid = user != 0;
         let record = Parsed {
             id,
             user,
@@ -656,21 +658,19 @@ fn parse_clicks(
     pending.clear();
     block.lines::<4>(|buf, fields| unsafe {
         let field = |at: usize| (buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize);
+        if fields[0].0 == fields[0].1 || fields[1].0 == fields[1].1 { return; }
+        let (p, n) = field(3);
+        let at = ts::parse(p, n, dates);
+        if at < earliest || at >= window_end { return; }
+        let (p, n) = field(2);
+        let campaign = shared.campaigns.get(p, n);
+        if campaign == 0 { return; }
         let (p, n) = field(0);
         let id = keys::pack(p, n);
         let (p, n) = field(1);
         let user = keys::pack(p, n);
-        if id == 0 || user == 0 {
-            return;
-        }
+        if id == 0 || user == 0 { return; }
         let (id, user) = (id ^ copy, user ^ copy);
-        let (p, n) = field(2);
-        let campaign = shared.campaigns.get(p, n);
-        let (p, n) = field(3);
-        let at = ts::parse(p, n, dates);
-        if campaign == 0 || at < earliest || at >= window_end {
-            return;
-        }
         pending.push(RawClick {
             user,
             id,
@@ -1017,9 +1017,9 @@ fn session_worker(
         totals: vec![[0; 4]; campaigns * shared.days],
         reach: vec![0; campaigns],
         place: vec![0; campaigns],
-        active: Vec::new(),
+        active: Vec::with_capacity(campaigns),
         sums: [0; 256],
-        touched: Vec::new(),
+        touched: Vec::with_capacity(shared.categories.len()),
     };
     let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
