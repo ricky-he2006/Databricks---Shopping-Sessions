@@ -5,7 +5,7 @@
 //! dictionary with bit-packed indices. The whole file is written in one call.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -52,6 +52,10 @@ pub struct Writer {
     columns: Vec<Column>,
     dictionary: Vec<u8>,
     dictionary_len: usize,
+    category_ranges: Vec<std::ops::Range<usize>>,
+    stream: Option<BufWriter<File>>,
+    written: u64,
+    write_error: Option<io::Error>,
     rows: usize,
     group_rows: usize,
     groups: Vec<GroupMeta>,
@@ -217,10 +221,18 @@ impl Writer {
         group_rows: usize,
         dictionary: &[Vec<u8>],
     ) -> io::Result<Self> {
+        let stream = if std::env::var_os("SS_PLAIN").is_none_or(|value| value != "0") {
+            Some(BufWriter::with_capacity(1 << 20, File::create(path)?))
+        } else {
+            None
+        };
+        let mut ranges = Vec::with_capacity(dictionary.len());
         let mut plain = Vec::new();
         for value in dictionary {
+            let start = plain.len();
             plain.extend_from_slice(&(value.len() as u32).to_le_bytes());
             plain.extend_from_slice(value);
+            ranges.push(start..plain.len());
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -238,6 +250,10 @@ impl Writer {
                 .collect(),
             dictionary: plain,
             dictionary_len: dictionary.len(),
+            category_ranges: ranges,
+            stream,
+            written: 0,
+            write_error: None,
             rows: 0,
             group_rows,
             groups: Vec::new(),
@@ -257,14 +273,14 @@ impl Writer {
     #[inline(always)]
     pub fn keyed(&mut self, column: usize, key: u64, write: impl FnOnce(&mut Vec<u8>)) {
         let column = &mut self.columns[column];
-        if column.last_key == key {
+        if self.stream.is_none() && column.last_key == key {
             if let Some(run) = column.runs.last_mut() {
                 *run += 1;
                 return;
             }
         }
         column.last_key = key;
-        column.runs.push(1);
+        if self.stream.is_none() { column.runs.push(1); }
         let at = column.bytes.len();
         column.bytes.extend_from_slice(&[0; 4]);
         write(&mut column.bytes);
@@ -281,13 +297,26 @@ impl Writer {
         }
         if let Some(value) = value {
             *column.present.last_mut().unwrap() |= 1 << (row & 7);
-            column.bytes.push(value);
+            if self.stream.is_some() {
+                column.bytes.extend_from_slice(&self.dictionary[self.category_ranges[value as usize].clone()]);
+            } else {
+                column.bytes.push(value);
+            }
         }
     }
 
     #[inline(always)]
     pub fn int(&mut self, column: usize, value: i64) {
-        self.columns[column].ints.push(value);
+        let column = &mut self.columns[column];
+        if self.stream.is_some() {
+            match column.kind {
+                Kind::Date | Kind::Int32 => column.bytes.extend_from_slice(&(value as i32).to_le_bytes()),
+                Kind::Int64 => column.bytes.extend_from_slice(&value.to_le_bytes()),
+                _ => unreachable!(),
+            }
+        } else {
+            column.ints.push(value);
+        }
     }
 
     #[inline(always)]
@@ -330,9 +359,23 @@ impl Writer {
         let mut chunks = Vec::with_capacity(self.columns.len());
         let mut body = Vec::new();
         for column in &mut self.columns {
-            let offset = self.out.len() as u64;
+            let offset = self.written + self.out.len() as u64;
             let mut data_offset = offset;
             body.clear();
+            if self.stream.is_some() {
+                if column.kind == Kind::Category {
+                    let groups = rows.div_ceil(8);
+                    let mut levels = Vec::new();
+                    varint(&mut levels, ((groups as u64) << 1) | 1);
+                    body.extend_from_slice(&((levels.len() + groups) as u32).to_le_bytes());
+                    body.extend_from_slice(&levels);
+                    body.extend_from_slice(&column.present[..groups]);
+                    body.extend_from_slice(&column.bytes);
+                    Self::page(&mut self.out, &body, rows, false, 0);
+                } else {
+                    Self::page(&mut self.out, &column.bytes, rows, false, 0);
+                }
+            } else {
             match column.kind {
                 Kind::Text => {
                     Self::page(&mut self.out, &column.bytes, rows, false, 0);
@@ -381,10 +424,11 @@ impl Writer {
                     Self::page(&mut self.out, &body, rows, false, 5);
                 }
             }
+            }
             chunks.push(ChunkMeta {
                 offset,
                 data_offset,
-                size: self.out.len() as u64 - offset,
+                size: self.written + self.out.len() as u64 - offset,
             });
             column.bytes.clear();
             column.runs.clear();
@@ -396,6 +440,13 @@ impl Writer {
             chunks,
         });
         self.rows = 0;
+        if let Some(stream) = self.stream.as_mut() {
+            if self.write_error.is_none() {
+                self.write_error = stream.write_all(&self.out).err();
+            }
+            self.written += self.out.len() as u64;
+            self.out.clear();
+        }
     }
 
     pub fn finish(mut self) -> io::Result<()> {
@@ -436,13 +487,16 @@ impl Writer {
             meta.begin(0);
             meta.list(1, 12, group.chunks.len());
             for (chunk, column) in group.chunks.iter().zip(&self.columns) {
-                let (physical, encodings): (i32, &[i64]) = match column.kind {
+                let (physical, mut encodings): (i32, &[i64]) = match column.kind {
                     Kind::Text => (6, &[0]),
                     Kind::Keyed => (6, &[0, 8]),
                     Kind::Category => (6, &[0, 8, 3]),
                     Kind::Date | Kind::Int32 => (1, &[5]),
                     Kind::Int64 => (2, &[5]),
                 };
+                if self.stream.is_some() {
+                    encodings = if column.kind == Kind::Category { &[0, 3] } else { &[0] };
+                }
                 meta.begin(0);
                 meta.i64(2, chunk.offset as i64);
                 meta.begin(3);
@@ -475,7 +529,13 @@ impl Writer {
         self.out.extend_from_slice(&meta.out);
         self.out.extend_from_slice(&length.to_le_bytes());
         self.out.extend_from_slice(b"PAR1");
-        File::create(&self.path)?.write_all(&self.out)
+        if let Some(mut stream) = self.stream {
+            if let Some(error) = self.write_error { return Err(error); }
+            stream.write_all(&self.out)?;
+            stream.flush()
+        } else {
+            File::create(&self.path)?.write_all(&self.out)
+        }
     }
 }
 
