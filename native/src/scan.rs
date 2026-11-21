@@ -100,7 +100,7 @@ pub struct Block {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[inline(always)]
-unsafe fn window(p: *const u8) -> (u64, u64) {
+unsafe fn window(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     // Block::load guarantees readable padding beyond the last newline:
     // either mapped slack or zeroed buffer bytes. This is the same
@@ -110,13 +110,13 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
         let commas = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8(b',' as i8));
         let newlines = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8(b'\n' as i8));
         let quotes = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8(b'"' as i8));
-        (commas | newlines, quotes)
+        (commas | newlines, newlines, quotes)
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
-unsafe fn window(p: *const u8) -> (u64, u64) {
+unsafe fn window(p: *const u8) -> (u64, u64, u64) {
     unsafe {
         use std::arch::x86_64::*;
         let low = _mm256_loadu_si256(p as *const __m256i);
@@ -126,18 +126,21 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
             _mm256_set1_epi8(b'\n' as i8),
             _mm256_set1_epi8(b'"' as i8),
         );
-        let ends = |v: __m256i| _mm256_or_si256(_mm256_cmpeq_epi8(v, comma), _mm256_cmpeq_epi8(v, newline));
         let bits = |v: __m256i| _mm256_movemask_epi8(v) as u32 as u64;
+        let both = |low: __m256i, high: __m256i| bits(low) | (bits(high) << 32);
+        let (line_low, line_high) = (_mm256_cmpeq_epi8(low, newline), _mm256_cmpeq_epi8(high, newline));
+        let lines = both(line_low, line_high);
         (
-            bits(ends(low)) | (bits(ends(high)) << 32),
-            bits(_mm256_cmpeq_epi8(low, quote)) | (bits(_mm256_cmpeq_epi8(high, quote)) << 32),
+            both(_mm256_cmpeq_epi8(low, comma), _mm256_cmpeq_epi8(high, comma)) | lines,
+            lines,
+            both(_mm256_cmpeq_epi8(low, quote), _mm256_cmpeq_epi8(high, quote)),
         )
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn window(p: *const u8) -> (u64, u64) {
+unsafe fn window(p: *const u8) -> (u64, u64, u64) {
     unsafe {
         use std::arch::aarch64::*;
         let bits: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
@@ -160,6 +163,12 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
         (
             pack([ends(chunks[0]), ends(chunks[1]), ends(chunks[2]), ends(chunks[3])]),
             pack([
+                vceqq_u8(chunks[0], newline),
+                vceqq_u8(chunks[1], newline),
+                vceqq_u8(chunks[2], newline),
+                vceqq_u8(chunks[3], newline),
+            ]),
+            pack([
                 vceqq_u8(chunks[0], quote),
                 vceqq_u8(chunks[1], quote),
                 vceqq_u8(chunks[2], quote),
@@ -171,15 +180,16 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
 
 #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
 #[inline(always)]
-unsafe fn window(p: *const u8) -> (u64, u64) {
+unsafe fn window(p: *const u8) -> (u64, u64, u64) {
     unsafe {
-        let (mut ends, mut quotes) = (0u64, 0u64);
+        let (mut ends, mut lines, mut quotes) = (0u64, 0u64, 0u64);
         for at in 0..64 {
             let byte = *p.add(at);
             ends |= u64::from(byte == b',' || byte == b'\n') << at;
+            lines |= u64::from(byte == b'\n') << at;
             quotes |= u64::from(byte == b'"') << at;
         }
-        (ends, quotes)
+        (ends, lines, quotes)
     }
 }
 
@@ -189,7 +199,7 @@ unsafe fn long_field(buf: *const u8, start: usize) -> (usize, bool, usize) {
     unsafe {
         let mut end = start + 64;
         loop {
-            let (ends, _) = window(buf.add(end));
+            let (ends, _, _) = window(buf.add(end));
             if ends != 0 {
                 end += ends.trailing_zeros() as usize;
                 break;
@@ -282,53 +292,153 @@ impl Block {
             let Some(mut newline) = head.iter().position(|&byte| byte == b'\n') else {
                 return;
             };
+            let mut cursor = Cursor::new(buf, (end + 63) & !63, newline + 1);
             while newline < own_end && newline + 1 < end {
                 fetch(buf.wrapping_add(newline + READ_AHEAD));
                 fetch(buf.wrapping_add(newline + READ_AHEAD + 64));
+                let line = newline + 1;
                 let mut fields = [(0u32, 0u32); N];
-                let mut count = 0usize;
-                let mut ok = true;
-                let mut start = newline + 1;
-                let mut at = start;
-                let (mut ends, mut quotes) = window(buf.add(at));
-                loop {
-                    let mut shift = start - at;
-                    let mut rest = if shift < 64 { ends >> shift } else { 0 };
-                    if rest == 0 {
-                        at = start;
-                        (ends, quotes) = window(buf.add(at));
-                        shift = 0;
-                        rest = ends;
-                    }
-                    let (stop, fine, opens) = if rest != 0 {
-                        let length = rest.trailing_zeros();
-                        let inside = (quotes >> shift) & ((1u64 << length) - 1);
-                        let opens = inside & 1;
-                        let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
-                        (
-                            start + length as usize,
-                            inside == wanted && (opens == 0 || length >= 2),
-                            opens as usize,
-                        )
-                    } else {
-                        ends = 0;
-                        long_field(buf, start)
-                    };
-                    ok &= fine;
-                    if count < N {
-                        fields[count] = ((start + opens) as u32, (stop - opens) as u32);
-                    }
-                    count += 1;
-                    if *buf.add(stop) == b'\n' {
-                        newline = stop;
-                        break;
-                    }
-                    start = stop + 1;
+                let found = cursor.split(line, &mut fields);
+                let ok;
+                if found != ODD {
+                    newline = found;
+                    ok = true;
+                } else {
+                    (ok, newline) = odd_line(buf, line, &mut fields);
+                    cursor = Cursor::new(buf, cursor.limit, newline + 1);
                 }
-                if ok && count == N {
+                if ok {
                     visit(buf, &fields);
                 }
             }
+        }
+    }
+}
+
+/// What `Cursor::split` returns for a line it leaves to `odd_line`.
+const ODD: usize = usize::MAX;
+
+/// Where the scan is: a 64-byte window of the block and what is left of it.
+struct Cursor {
+    buf: *const u8,
+    /// No window starts at or after this.
+    limit: usize,
+    /// Start of the current window, a multiple of 64.
+    at: usize,
+    /// The window's commas and newlines not yet used, its newlines from the
+    /// current line on, and all its quotes.
+    ends: u64,
+    newlines: u64,
+    quotes: u64,
+    /// Quotes in the windows before `at`, and before the current line.
+    counted: u32,
+    before: u32,
+}
+
+impl Cursor {
+    #[inline(always)]
+    unsafe fn new(buf: *const u8, limit: usize, line: usize) -> Self {
+        unsafe {
+            let at = line & !63;
+            let (ends, newlines, quotes) = window(buf.add(at));
+            let keep = !0u64 << (line & 63);
+            Self {
+                buf,
+                limit,
+                at,
+                ends: ends & keep,
+                newlines: newlines & keep,
+                quotes,
+                counted: 0,
+                before: (quotes & !keep).count_ones(),
+            }
+        }
+    }
+
+    /// Splits the line starting at `line` if it is the usual kind: `N` fields,
+    /// each bare or wrapped in one pair of quotes. Returns where its newline
+    /// is, or `ODD` for any other line, after which the cursor must be rebuilt.
+    /// Kept out of line so its loops have the registers to themselves.
+    #[inline(never)]
+    unsafe fn split<const N: usize>(&mut self, line: usize, fields: &mut [(u32, u32); N]) -> usize {
+        unsafe {
+            let buf = self.buf;
+            let (mut at, mut ends) = (self.at, self.ends);
+            let mut stops = [0u32; N];
+            let mut early = 0u64;
+            for stop in stops.iter_mut() {
+                while ends == 0 {
+                    if at + 64 >= self.limit {
+                        return ODD;
+                    }
+                    // A newline left behind here ends the line before its last field.
+                    early |= self.newlines;
+                    self.counted += self.quotes.count_ones();
+                    at += 64;
+                    (ends, self.newlines, self.quotes) = window(buf.add(at));
+                }
+                *stop = (at + ends.trailing_zeros() as usize) as u32;
+                ends &= ends - 1;
+            }
+            self.at = at;
+            self.ends = ends;
+            let last = stops[N - 1] as usize;
+            let within = (last - at) as u32;
+            // The line's first newline must be its last separator.
+            let through = 2u64.wrapping_shl(within).wrapping_sub(1);
+            let mut odd = early | ((self.newlines & through) ^ (1u64 << within));
+            self.newlines &= !through;
+            let mut opened = 0u32;
+            let mut start = line as u32;
+            for (slot, &stop) in fields.iter_mut().zip(&stops) {
+                let opens = u32::from(*buf.add(start as usize) == b'"');
+                let closes = u32::from(*buf.add(stop as usize - 1) == b'"');
+                odd |= u64::from(opens ^ closes);
+                opened += opens;
+                *slot = (start + opens, stop - opens);
+                start = stop + 1;
+            }
+            let here = self.counted + (self.quotes & ((1u64 << within) - 1)).count_ones();
+            odd |= u64::from(here.wrapping_sub(self.before) ^ (2 * opened));
+            self.before = here;
+            if odd == 0 { last } else { ODD }
+        }
+    }
+}
+
+/// One line the fast path would not take: its fields, whether it is a good
+/// line of `N` fields, and where its newline is.
+#[cold]
+#[inline(never)]
+unsafe fn odd_line<const N: usize>(buf: *const u8, first: usize, fields: &mut [(u32, u32); N]) -> (bool, usize) {
+    unsafe {
+        let mut count = 0usize;
+        let mut ok = true;
+        let mut start = first;
+        loop {
+            let (ends, _, quotes) = window(buf.add(start));
+            let (stop, fine, opens) = if ends != 0 {
+                let length = ends.trailing_zeros();
+                let inside = quotes & ((1u64 << length) - 1);
+                let opens = inside & 1;
+                let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
+                (
+                    start + length as usize,
+                    inside == wanted && (opens == 0 || length >= 2),
+                    opens as usize,
+                )
+            } else {
+                long_field(buf, start)
+            };
+            ok &= fine;
+            if count < N {
+                fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+            }
+            count += 1;
+            if *buf.add(stop) == b'\n' {
+                return (ok && count == N, stop);
+            }
+            start = stop + 1;
         }
     }
 }
