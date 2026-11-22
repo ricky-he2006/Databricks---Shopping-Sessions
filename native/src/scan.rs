@@ -77,6 +77,7 @@ impl Source {
                     if file_map == region {
                         self.map = region.cast();
                         self.guarded_tail = true;
+                        madvise(region, length, 3);
                     } else {
                         munmap(region,length);
                     }

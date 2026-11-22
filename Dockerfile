@@ -22,7 +22,7 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
     if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
     mkdir -p /app && \
     if [ "$TARGETARCH" = amd64 ]; then \
-        apt-get update && apt-get install -y --no-install-recommends patch && \
+        apt-get update && apt-get install -y --no-install-recommends patch "$cross" "libc6-dev-$TARGETARCH-cross" && \
         for level in base v3 v4 wide; do \
             cpu=x86-64-$level; profile=v5; features=; \
             case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
@@ -36,8 +36,5 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
     fi
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2 && rm -rf /var/lib/apt/lists/*
-ENV LD_PRELOAD=libjemalloc.so.2
-ENV MALLOC_CONF=narenas:2,background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:auto
 COPY --from=builder /app /app
-CMD ["/app/shopping-sessions"]
+ENTRYPOINT ["/app/shopping-sessions"]

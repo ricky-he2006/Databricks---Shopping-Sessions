@@ -238,18 +238,22 @@ pub unsafe fn pack_plain(p: *const u8, len: usize) -> u64 {
 }
 
 /// Appends the string of `key` to `out`.
-#[inline]
+#[inline(always)]
 pub fn unpack(key: u64, out: &mut Vec<u8>) {
     if key & INTERNED == 0 {
+        let mut buf = [0u8; 9];
+        let mut len = 0;
         let mut shift = 56i32;
         while shift >= 0 {
             let byte = ((key >> shift) & 0x7F) as u8;
             if byte == 0 {
                 break;
             }
-            out.push(byte);
+            buf[len] = byte;
+            len += 1;
             shift -= 7;
         }
+        out.extend_from_slice(&buf[..len]);
     } else {
         out.extend_from_slice(name(key));
     }

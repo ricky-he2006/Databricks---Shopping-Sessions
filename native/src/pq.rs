@@ -229,11 +229,11 @@ impl Writer {
                 .map(|&(name, kind)| Column {
                     name,
                     kind,
-                    bytes: Vec::new(),
-                    runs: Vec::new(),
+                    bytes: Vec::with_capacity(if kind == Kind::Keyed { group_rows * 16 } else if kind == Kind::Category { group_rows } else { 0 }),
+                    runs: Vec::with_capacity(if kind == Kind::Keyed { group_rows } else { 0 }),
                     last_key: 0,
-                    present: Vec::new(),
-                    ints: Vec::new(),
+                    present: Vec::with_capacity(if kind == Kind::Category { group_rows / 8 + 1 } else { 0 }),
+                    ints: Vec::with_capacity(if matches!(kind, Kind::Date | Kind::Int32 | Kind::Int64) { group_rows } else { 0 }),
                 })
                 .collect(),
             dictionary: plain,
@@ -266,6 +266,7 @@ impl Writer {
         column.last_key = key;
         column.runs.push(1);
         let at = column.bytes.len();
+        column.bytes.reserve(48);
         column.bytes.extend_from_slice(&[0; 4]);
         write(&mut column.bytes);
         let length = (column.bytes.len() - at - 4) as u32;

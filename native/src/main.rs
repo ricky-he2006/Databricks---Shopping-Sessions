@@ -26,6 +26,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn _exit(status: i32) -> !;
+}
+
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: u64 = 1_800_000;
@@ -410,7 +415,19 @@ impl Links {
                 let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
                 if found != 0 { return group.values[found.trailing_zeros() as usize]; }
             }
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use std::arch::aarch64::*;
+                let k = vdupq_n_u64(key);
+                let p = group.keys.as_ptr();
+                let cmp0 = vceqq_u64(vld1q_u64(p), k);
+                let cmp1 = vceqq_u64(vld1q_u64(p.add(2)), k);
+                if vgetq_lane_u64(cmp0, 0) != 0 { return group.values[0]; }
+                if vgetq_lane_u64(cmp0, 1) != 0 { return group.values[1]; }
+                if vgetq_lane_u64(cmp1, 0) != 0 { return group.values[2]; }
+                if vgetq_lane_u64(cmp1, 1) != 0 { return group.values[3]; }
+            }
+            #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
             if let Some(lane) = group.keys.iter().position(|&k| k == key) {
                 return group.values[lane];
             }
@@ -704,12 +721,29 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let (id, partition_hash) = if n == 33 && shared.defer_long_events {
-            let bytes = &*p.cast::<[u8; 33]>();
-            let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
-            (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
+        if n == 0 {
+            return;
+        }
+        let (id, partition_hash) = if shared.defer_long_events {
+            if n <= 9 && *p == b'e' && *p.add(n - 1) != 0 && (n < 9 || *p.add(8) < 128) {
+                let suffix = u64::from_le((p.add(1) as *const u64).read_unaligned());
+                let mask = u64::MAX.checked_shr((9 - n) as u32 * 8).unwrap_or(0);
+                let id = (suffix & mask) ^ copy;
+                (id, id.wrapping_mul(MIX))
+            } else if n == 33 {
+                let bytes = &*p.cast::<[u8; 33]>();
+                let fingerprint = event_fingerprint(bytes);
+                let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
+                out.names.push(*bytes);
+                (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
+            } else {
+                let id = keys::pack(p, n);
+                if id == 0 {
+                    return;
+                }
+                let id = id ^ copy;
+                (id, id.wrapping_mul(MIX))
+            }
         } else {
             let id = keys::pack(p, n);
             if id == 0 {
@@ -723,11 +757,6 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         if ingest == ts::BAD {
             return;
         }
-        let (name,n) = field(1);
-        let deferred = n == 33 && shared.defer_long_events;
-        let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
-        let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -736,23 +765,35 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
-        let mut valid = user != 0
-            && (purchase || other)
-            && field(5).1 > 0
-            && at >= window_start
-            && at < window_end
-            && ingest - at <= DAY;
+        let (prod_p, prod_n) = field(5);
+        let in_window = at >= window_start && at < window_end && ingest - at <= DAY;
+        let mut valid = in_window && (purchase || other) && prod_n > 0;
+        let mut user = 0;
         let mut payload = 0;
-        if purchase && valid {
-            let (p, n) = field(6);
-            let price = ts::price(p, n);
-            if price == 0 {
+        let mut deferred = false;
+        let mut mixed = 0;
+        let mut name = std::ptr::null();
+        if valid {
+            let (un, ul) = field(1);
+            deferred = ul == 33 && shared.defer_long_events;
+            mixed = if deferred { keys::prepare_long_user(un) } else { 0 };
+            user = if deferred { 1 } else { keys::pack_user(un, ul) };
+            if user == 0 {
                 valid = false;
             } else {
-                let (p, n) = field(5);
-                let category = shared.products.get(p, n);
-                let category = if category == 0 { shared.unknown } else { category - 1 };
-                payload = (category << 24) | price;
+                user ^= copy;
+                name = un;
+                if purchase {
+                    let (p, n) = field(6);
+                    let price = ts::price(p, n);
+                    if price == 0 {
+                        valid = false;
+                    } else {
+                        let category = shared.products.get(prod_p, prod_n);
+                        let category = if category == 0 { shared.unknown } else { category - 1 };
+                        payload = (category << 24) | price;
+                    }
+                }
             }
         }
         let record = Parsed {
@@ -763,7 +804,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             payload,
         };
         let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
-        if deferred {
+        if deferred && valid {
             lookups[queued] = (name,dest,mixed);
             queued += 1;
             if queued == LOOKUPS {
@@ -814,6 +855,16 @@ fn parse_clicks(
     };
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
+        let (p, n) = field(3);
+        let at = ts::parse(p, n, dates);
+        if at < earliest || at >= window_end {
+            return;
+        }
+        let (p, n) = field(2);
+        let campaign = shared.campaigns.get(p, n);
+        if campaign == 0 {
+            return;
+        }
         let (p, n) = field(0);
         let id = if n == 33 && shared.defer_long_events {
             let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
@@ -830,13 +881,6 @@ fn parse_clicks(
             return;
         }
         let (id, user) = (id ^ copy, user ^ copy);
-        let (p, n) = field(2);
-        let campaign = shared.campaigns.get(p, n);
-        let (p, n) = field(3);
-        let at = ts::parse(p, n, dates);
-        if campaign == 0 || at < earliest || at >= window_end {
-            return;
-        }
         let index = pending.len();
         pending.push(RawClick {
             user,
@@ -925,6 +969,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
+    let mut used_slots: Vec<usize> = Vec::new();
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -940,10 +985,12 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         if total == 0 {
             continue;
         }
-        let capacity = (total * 2).next_power_of_two();
+        let needed = (total * 2 + 16).next_power_of_two();
+        if needed > table.len() {
+            table.resize(needed, NONE);
+        }
+        let capacity = table.len();
         let mask = capacity - 1;
-        table.clear();
-        table.resize(capacity, NONE);
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
@@ -957,6 +1004,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
                             *table.get_unchecked_mut(slot) = entry;
+                            used_slots.push(slot);
                             break;
                         }
                         let other = chunks
@@ -1013,6 +1061,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for &(base, _) in &chunks {
                 out.donate(base as *mut u8);
             }
+            for &slot in &used_slots {
+                *table.get_unchecked_mut(slot) = NONE;
+            }
+            used_slots.clear();
         }
     }
     out
@@ -1046,6 +1098,7 @@ struct Sessions<'a> {
 }
 
 impl Sessions<'_> {
+    #[inline(always)]
     fn row(&mut self, person: u64, day: u32, sessions: u32, events: u32, revenue: u64) -> io::Result<()> {
         let shared = self.shared;
         if self.writer.is_none() {
@@ -1066,20 +1119,32 @@ impl Sessions<'_> {
         writer.int(2, sessions as i64);
         writer.int(3, events as i64);
         writer.int(4, revenue as i64);
-        let mut top: Option<usize> = None;
-        for &category in &self.touched {
-            let category = category as usize;
-            top = match top {
-                Some(best) if self.sums[best] > self.sums[category] => Some(best),
-                Some(best) if self.sums[best] == self.sums[category] && best < category => Some(best),
-                _ => Some(category),
-            };
-        }
-        for &category in &self.touched {
-            self.sums[category as usize] = 0;
-        }
-        self.touched.clear();
-        writer.category(5, top.map(|category| category as u8));
+        let top: Option<u8> = match self.touched.as_slice() {
+            [] => None,
+            &[cat] => {
+                self.sums[cat as usize] = 0;
+                self.touched.clear();
+                Some(cat)
+            }
+            slice => {
+                let mut best = slice[0] as usize;
+                let mut best_sum = self.sums[best];
+                for &cat in &slice[1..] {
+                    let cat = cat as usize;
+                    let sum = self.sums[cat];
+                    if sum > best_sum || (sum == best_sum && cat < best) {
+                        best = cat;
+                        best_sum = sum;
+                    }
+                }
+                for &cat in slice {
+                    self.sums[cat as usize] = 0;
+                }
+                self.touched.clear();
+                Some(best as u8)
+            }
+        };
+        writer.category(5, top);
         writer.end_row();
         Ok(())
     }
@@ -1312,6 +1377,7 @@ fn session_worker(
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
     let mut table_keys: Vec<u64> = Vec::new();
     let mut table_ids: Vec<u32> = Vec::new();
+    let mut used_slots: Vec<usize> = Vec::new();
     let mut persons: Vec<u64> = Vec::new();
     let mut ends: Vec<u32> = Vec::new();
     let mut local: Vec<u32> = Vec::new();
@@ -1332,12 +1398,13 @@ fn session_worker(
         }
 
         // Group the events by person: number the people as they appear.
-        let mut capacity = (total / 4 + 16).next_power_of_two();
-        let mut mask = capacity - 1;
-        table_keys.clear();
-        table_keys.resize(capacity, 0);
-        table_ids.clear();
-        table_ids.resize(capacity, 0);
+        let needed = (total * 2 + 16).next_power_of_two();
+        if needed > table_keys.len() {
+            table_keys.resize(needed, 0);
+            table_ids.resize(needed, 0);
+        }
+        let capacity = table_keys.len();
+        let mask = capacity - 1;
         persons.clear();
         ends.clear();
         local.clear();
@@ -1355,6 +1422,7 @@ fn session_worker(
                             let id = persons.len() as u32;
                             *table_keys.get_unchecked_mut(slot) = person;
                             *table_ids.get_unchecked_mut(slot) = id;
+                            used_slots.push(slot);
                             persons.push(person);
                             ends.push(0);
                             break id;
@@ -1363,22 +1431,6 @@ fn session_worker(
                     };
                     *ends.get_unchecked_mut(id as usize) += 1;
                     local.push(id);
-                    if persons.len() * 2 > capacity {
-                        capacity *= 2;
-                        mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
-                        for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
-                                slot = (slot + 1) & mask;
-                            }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
-                        }
-                    }
                 }
             }
             // `ends` holds counts; make it each person's first slot, then fill,
@@ -1469,26 +1521,77 @@ fn session_worker(
             }
         }
 
+        for &slot in &used_slots {
+            unsafe {
+                *table_keys.get_unchecked_mut(slot) = 0;
+            }
+        }
+        used_slots.clear();
+
         let (mut from, mut click_from) = (0usize, 0usize);
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
-            if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
-            } else {
-                #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
-                if mine.len() <= 32 {
-                    if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
-                } else {
-                    if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
-                    sort_medium_times(mine,&mut scratch[..mine.len()],12);
+            if mine.len() == 2 {
+                if mine[0] > mine[1] {
+                    mine.swap(0, 1);
                 }
-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
-                mine.sort_unstable();
+            } else if mine.len() == 3 {
+                if mine[0] > mine[1] { mine.swap(0, 1); }
+                if mine[1] > mine[2] { mine.swap(1, 2); }
+                if mine[0] > mine[1] { mine.swap(0, 1); }
+            } else if mine.len() == 4 {
+                if mine[0] > mine[1] { mine.swap(0, 1); }
+                if mine[2] > mine[3] { mine.swap(2, 3); }
+                if mine[0] > mine[2] { mine.swap(0, 2); }
+                if mine[1] > mine[3] { mine.swap(1, 3); }
+                if mine[1] > mine[2] { mine.swap(1, 2); }
+            } else if mine.len() > 4 {
+                if mine.len() <= 8 {
+                    for i in 1..mine.len() {
+                        let mut j = i;
+                        while j > 0 && mine[j - 1] > mine[j] {
+                            mine.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+                } else if mine.len() > 2048 {
+                    sort_by_time(mine, &mut scratch);
+                } else {
+                    #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
+                    if mine.len() <= 32 {
+                        if mine.len() >= 5 { unsafe { sort_short_times(mine) } } else { mine.sort_unstable(); }
+                    } else {
+                        if scratch.len() < mine.len() { scratch.resize(mine.len(), 0); }
+                        sort_medium_times(mine, &mut scratch[..mine.len()], 12);
+                    }
+                    #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                    mine.sort_unstable();
+                }
             }
             let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
+            if reached.len() == 2 {
+                let cmp = reached[0].ts.cmp(&reached[1].ts)
+                    .then_with(|| click_order(reached[0].id, reached[1].id, clicks, shared.defer_long_events));
+                if cmp.is_gt() {
+                    reached.swap(0, 1);
+                }
+            } else if reached.len() > 2 && reached.len() <= 6 {
+                for i in 1..reached.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        let cmp = reached[j - 1].ts.cmp(&reached[j].ts)
+                            .then_with(|| click_order(reached[j - 1].id, reached[j].id, clicks, shared.defer_long_events));
+                        if cmp.is_gt() {
+                            reached.swap(j - 1, j);
+                            j -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            } else if reached.len() > 6 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
             sessions.person(person, mine, reached)?;
@@ -1504,15 +1607,6 @@ fn session_worker(
 }
 
 // ---------------------------------------------------------------- main
-
-fn large_private_cache() -> bool {
-    let dir = "/sys/devices/system/cpu/cpu0/cache/index2";
-    if !fs::read_to_string(format!("{dir}/level")).is_ok_and(|v| v.trim()=="2") { return false; }
-    let Ok(size) = fs::read_to_string(format!("{dir}/size")) else {return false};
-    let text=size.trim();
-    text.strip_suffix('K').and_then(|n|n.parse::<usize>().ok()).is_some_and(|n|n>=2048)
-        || text.strip_suffix('M').and_then(|n|n.parse::<usize>().ok()).is_some_and(|n|n>=2)
-}
 
 fn tune(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -1637,11 +1731,9 @@ fn main() -> io::Result<()> {
     if copies == 1 { keys::prepare_users(input_bytes); }
     // At intermediate sizes, fewer active destinations reduce scattered
     // writes. Larger inputs need finer partitions for the dedup table.
-    let medium = (1 << 30..4u64 << 30).contains(&input_bytes);
     let partition_bits = |bytes_per_part| input_bytes.div_ceil(bytes_per_part).max(threads as u64 * 8).ilog2();
-    let fine = medium && large_private_cache();
-    let id_bits = partition_bits(if medium && !fine { 2 << 20 } else { 1 << 20 });
-    let person_bits = partition_bits(if medium && !fine { 4 << 20 } else { 1 << 20 });
+    let id_bits = partition_bits(1 << 20);
+    let person_bits = partition_bits(1 << 20);
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
@@ -1826,7 +1918,11 @@ fn main() -> io::Result<()> {
         LINKS_MICROS.load(Ordering::Relaxed) as f64 / 1e6,
         total.as_secs_f64()
     );
-    // Everything left is memory the kernel frees faster than we can.
+    // All output is durable at this point. Skip libc/destructor teardown:
+    // kernel reclamation of the multi-gigabyte arenas is outside the run.
+    #[cfg(target_os = "linux")]
+    unsafe { _exit(0) };
+    #[cfg(not(target_os = "linux"))]
     std::process::exit(0);
 }
 
