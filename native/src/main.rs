@@ -49,7 +49,6 @@ const NONE: u32 = u32::MAX;
 const MAX_THREADS: usize = 32;
 const GROUP_ROWS: usize = 1 << 17;
 /// How many records ahead to prefetch a links lookup.
-const AHEAD: usize = 16;
 
 // ---------------------------------------------------------------- buckets
 
@@ -1707,12 +1706,17 @@ fn main() -> io::Result<()> {
     let total: u64 = files.iter().map(|source| source.size).sum();
     let large = total >= 4u64 << 30;
     let map_by_default = total >= 1 << 30;
-    let block = tune("SS_BLOCK", if map_by_default { 1 << 21 } else { BLOCK }).max(4096);
+    let block = tune(
+        "SS_BLOCK",
+        if large { 1 << 22 } else if map_by_default { 1 << 20 } else { BLOCK },
+    )
+    .max(4096);
     let map = tune("SS_MAP", 1) != 0;
     // Release mapped working sets in parallel so exit does not reclaim
     // every input page on one thread.
     let release_pages = large || (cfg!(target_os = "linux") && map_by_default && map);
-    let give_back = tune("SS_RELEASE", u64::from(release_pages)) != 0;
+    let _ = release_pages;
+    let give_back = tune("SS_RELEASE", 0) != 0;
     for (file, source) in files.iter_mut().enumerate() {
         if map {
             source.map_input();
@@ -1752,7 +1756,7 @@ fn main() -> io::Result<()> {
         defer_long_events: copies == 1,
         id_bits: tune("SS_ID_BITS", id_bits.min(if large { 12 } else { ID_BITS + 1 }) as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", person_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
-        ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
+        ahead: tune("SS_AHEAD", 32) as usize,
         links: OnceLock::new(),
         output,
         days: ((window_end - 1).div_euclid(DAY) - first_day + 1) as usize,
